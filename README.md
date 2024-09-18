@@ -2,6 +2,8 @@
 
 This library provides an `EguiArea` widget for integrating egui inside of GTK applications. It uses the gtk `GLArea` widget as the base with the [egui_glow](https://github.com/emilk/egui/tree/master/crates/egui_glow) renderer to draw inside of it.
 
+![image](https://github.com/user-attachments/assets/76ad5af6-848c-4400-a2a1-8247c1ed36b4)
+
 See [demo](./examples/demo.rs) for usage example.
 
 Supported features:
