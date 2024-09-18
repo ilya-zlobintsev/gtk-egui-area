@@ -1,0 +1,18 @@
+[package]
+name = "gtk-egui-area"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+# egui = { git = "https://github.com/emilk/egui" }
+# egui_demo_lib = { git = "https://github.com/emilk/egui" }
+# egui_glow = { git = "https://github.com/emilk/egui" }
+egui = "0.28.1"
+egui_demo_lib = "0.28.1"
+egui_glow = "0.28.1"
+epoxy = "0.1.0"
+gl_loader = "0.1.2"
+gtk = { version = "0.9.1", package = "gtk4" }
+libloading = "0.8.5"
