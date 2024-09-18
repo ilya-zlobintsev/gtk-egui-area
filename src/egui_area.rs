@@ -42,10 +42,11 @@ impl EguiArea {
 
 mod imp {
     use egui_glow::glow;
+    use glib::clone;
     use gtk::{
         gdk::GLContext,
-        glib,
-        prelude::{GLAreaExt, NativeExt, SurfaceExt, WidgetExt, WidgetExtManual},
+        gio, glib,
+        prelude::{Cast, GLAreaExt, NativeExt, SurfaceExt, WidgetExt, WidgetExtManual},
         subclass::{
             prelude::{
                 GLAreaImpl, ObjectImpl, ObjectImplExt, ObjectSubclass, ObjectSubclassExt,
@@ -56,6 +57,7 @@ mod imp {
     };
     use std::{
         cell::{Cell, RefCell},
+        rc::Rc,
         sync::Arc,
         time::{Duration, Instant},
     };
@@ -83,100 +85,10 @@ mod imp {
             self.parent_constructed();
 
             let obj = self.obj().clone();
-
             obj.set_can_focus(true);
             obj.set_focusable(true);
 
-            let gesture_click = gtk::GestureClick::new();
-            gesture_click.connect_pressed(move |_gesture, _num, x, y| {
-                let mut events = obj.imp().input_events.borrow_mut();
-                events.push(egui::Event::PointerButton {
-                    pos: egui::pos2(x as f32, y as f32),
-                    button: egui::PointerButton::Primary,
-                    pressed: true,
-                    modifiers: egui::Modifiers::default(),
-                });
-            });
-            let obj = self.obj().clone();
-            gesture_click.connect_released(move |_gesture, _num, x, y| {
-                let mut events = obj.imp().input_events.borrow_mut();
-                events.push(egui::Event::PointerButton {
-                    pos: egui::pos2(x as f32, y as f32),
-                    button: egui::PointerButton::Primary,
-                    pressed: false,
-                    modifiers: egui::Modifiers::default(),
-                });
-            });
-
-            let obj = self.obj().clone();
-            let event_controller_motion = gtk::EventControllerMotion::new();
-            event_controller_motion.connect_motion(move |_motion, x, y| {
-                let mut events = obj.imp().input_events.borrow_mut();
-                events.push(egui::Event::PointerMoved(egui::pos2(x as f32, y as f32)));
-            });
-            let obj = self.obj().clone();
-            event_controller_motion.connect_leave(move |_motion| {
-                let mut events = obj.imp().input_events.borrow_mut();
-                events.push(egui::Event::PointerGone);
-            });
-
-            let obj = self.obj().clone();
-
-            let event_controller_scroll = gtk::EventControllerScroll::new(
-                gtk::EventControllerScrollFlags::BOTH_AXES
-                    | gtk::EventControllerScrollFlags::DISCRETE,
-            );
-            event_controller_scroll.connect_scroll(move |_scroll, x, y| {
-                let mut events = obj.imp().input_events.borrow_mut();
-
-                events.push(egui::Event::MouseWheel {
-                    unit: egui::MouseWheelUnit::Line,
-                    delta: egui::Vec2::new(-x as f32, -y as f32),
-                    modifiers: egui::Modifiers::default(),
-                });
-                glib::Propagation::Proceed
-            });
-
-            let obj = self.obj().clone();
-            let event_controller_key = gtk::EventControllerKey::new();
-            event_controller_key.connect_key_pressed(move |_controller, key, _code, _modifier| {
-                let mut events = obj.imp().input_events.borrow_mut();
-
-                if let Some(name) = key.name() {
-                    if let Some(key) = egui::Key::from_name(&name) {
-                        events.push(egui::Event::Key {
-                            key,
-                            physical_key: None,
-                            pressed: true,
-                            repeat: false,
-                            modifiers: egui::Modifiers::default(),
-                        });
-                    }
-                }
-                glib::Propagation::Proceed
-            });
-            let obj = self.obj().clone();
-            event_controller_key.connect_key_released(move |_controller, key, _code, _modifier| {
-                let mut events = obj.imp().input_events.borrow_mut();
-
-                if let Some(name) = key.name() {
-                    if let Some(key) = egui::Key::from_name(&name) {
-                        events.push(egui::Event::Key {
-                            key,
-                            physical_key: None,
-                            pressed: false,
-                            repeat: false,
-                            modifiers: egui::Modifiers::default(),
-                        });
-                    }
-                }
-            });
-
-            let obj = self.obj().clone();
-            obj.add_controller(event_controller_motion);
-            obj.add_controller(gesture_click);
-            obj.add_controller(event_controller_scroll);
-            obj.add_controller(event_controller_key);
+            self.register_controllers();
 
             let last_render = Cell::new(Instant::now());
             obj.add_tick_callback(move |area, _frame_clock| {
@@ -250,6 +162,8 @@ mod imp {
 
                 let full_output = self.egui_ctx.run(input, run_ui);
 
+                self.handle_platform_output(full_output.platform_output);
+
                 let clipped_primitives = self
                     .egui_ctx
                     .tessellate(full_output.shapes, full_output.pixels_per_point);
@@ -286,5 +200,233 @@ mod imp {
                 (height * scale_factor) as u32,
             ]
         }
+
+        fn handle_platform_output(&self, output: egui::PlatformOutput) {
+            if !output.copied_text.is_empty() {
+                let clipboard = self.obj().clipboard();
+                clipboard.set_text(&output.copied_text);
+            }
+
+            if let Some(url) = output.open_url {
+                let window = self
+                    .obj()
+                    .root()
+                    .and_then(|root| root.downcast::<gtk::Window>().ok());
+                gtk::show_uri(window.as_ref(), &url.url, 0);
+            }
+        }
+
+        fn register_controllers(&self) {
+            let obj = self.obj().clone();
+            let current_modifiers = Rc::new(Cell::new(egui::Modifiers::default()));
+
+            let gesture_click = gtk::GestureClick::new();
+            gesture_click.connect_pressed(clone!(
+                #[strong]
+                current_modifiers,
+                #[strong]
+                obj,
+                move |_gesture, _num, x, y| {
+                    let mut events = obj.imp().input_events.borrow_mut();
+                    events.push(egui::Event::PointerButton {
+                        pos: egui::pos2(x as f32, y as f32),
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: current_modifiers.get(),
+                    });
+                }
+            ));
+            gesture_click.connect_released(clone!(
+                #[strong]
+                current_modifiers,
+                #[strong]
+                obj,
+                move |_gesture, _num, x, y| {
+                    let mut events = obj.imp().input_events.borrow_mut();
+                    events.push(egui::Event::PointerButton {
+                        pos: egui::pos2(x as f32, y as f32),
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: current_modifiers.get(),
+                    });
+                }
+            ));
+
+            let obj = self.obj().clone();
+            let event_controller_motion = gtk::EventControllerMotion::new();
+            event_controller_motion.connect_motion(move |_motion, x, y| {
+                let mut events = obj.imp().input_events.borrow_mut();
+                events.push(egui::Event::PointerMoved(egui::pos2(x as f32, y as f32)));
+            });
+            let obj = self.obj().clone();
+            event_controller_motion.connect_leave(move |_motion| {
+                let mut events = obj.imp().input_events.borrow_mut();
+                events.push(egui::Event::PointerGone);
+            });
+
+            let obj = self.obj().clone();
+
+            let event_controller_scroll = gtk::EventControllerScroll::new(
+                gtk::EventControllerScrollFlags::BOTH_AXES
+                    | gtk::EventControllerScrollFlags::DISCRETE,
+            );
+            event_controller_scroll.connect_scroll(clone!(
+                #[strong]
+                current_modifiers,
+                move |_scroll, x, y| {
+                    let mut events = obj.imp().input_events.borrow_mut();
+
+                    events.push(egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Line,
+                        delta: egui::Vec2::new(-x as f32, -y as f32),
+                        modifiers: current_modifiers.get(),
+                    });
+                    glib::Propagation::Proceed
+                }
+            ));
+
+            let obj = self.obj().clone();
+            let event_controller_key = gtk::EventControllerKey::new();
+            event_controller_key.connect_key_pressed(move |_controller, key, _code, modifiers| {
+                let mut events = obj.imp().input_events.borrow_mut();
+
+                if modifiers.is_empty() || modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK) {
+                    if let Some(char) = key.to_unicode() {
+                        if !char.is_control() {
+                            events.push(egui::Event::Text(char.into()));
+                        }
+                    }
+                }
+
+                if let Some(key) = gdk_to_egui_key(key) {
+                    let modifiers = gdk_to_egui_modifiers(modifiers);
+
+                    if is_copy_command(modifiers, key) {
+                        events.push(egui::Event::Copy);
+                    } else if is_cut_command(modifiers, key) {
+                        events.push(egui::Event::Cut);
+                    } else if is_paste_command(modifiers, key) {
+                        let clipboard = obj.clipboard();
+                        let obj = obj.clone();
+                        clipboard.read_text_async(gio::Cancellable::NONE, move |result| {
+                            if let Ok(Some(text)) = result {
+                                obj.imp()
+                                    .input_events
+                                    .borrow_mut()
+                                    .push(egui::Event::Paste(text.to_string()));
+                            }
+                        });
+                    }
+
+                    events.push(egui::Event::Key {
+                        key,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers,
+                    });
+                }
+                glib::Propagation::Proceed
+            });
+            let obj = self.obj().clone();
+            event_controller_key.connect_key_released(move |_controller, key, _code, modifiers| {
+                let mut events = obj.imp().input_events.borrow_mut();
+
+                if let Some(key) = gdk_to_egui_key(key) {
+                    events.push(egui::Event::Key {
+                        key,
+                        physical_key: None,
+                        pressed: false,
+                        repeat: false,
+                        modifiers: gdk_to_egui_modifiers(modifiers),
+                    });
+                }
+            });
+            event_controller_key.connect_modifiers(move |_controller, new_modifiers| {
+                current_modifiers.set(gdk_to_egui_modifiers(new_modifiers));
+                glib::Propagation::Proceed
+            });
+
+            let obj = self.obj().clone();
+            obj.add_controller(event_controller_motion);
+            obj.add_controller(gesture_click);
+            obj.add_controller(event_controller_scroll);
+            obj.add_controller(event_controller_key);
+        }
+    }
+
+    fn gdk_to_egui_key(key: gtk::gdk::Key) -> Option<egui::Key> {
+        use egui::Key as EguiKey;
+        use gtk::gdk::Key;
+        let key = match key {
+            Key::BackSpace => EguiKey::Backspace,
+            Key::Down => EguiKey::ArrowDown,
+            Key::Up => EguiKey::ArrowUp,
+            Key::Left => EguiKey::ArrowLeft,
+            Key::Right => EguiKey::ArrowRight,
+            Key::KP_Enter | Key::ISO_Enter => EguiKey::Enter,
+            Key::space | Key::KP_Space => EguiKey::Space,
+            Key::Page_Up => EguiKey::PageUp,
+            Key::Page_Down => EguiKey::PageDown,
+            Key::colon => EguiKey::Colon,
+            Key::comma => EguiKey::Comma,
+            Key::backslash => EguiKey::Backslash,
+            Key::slash => EguiKey::Slash,
+            Key::vertbar => EguiKey::Pipe,
+            Key::question => EguiKey::Questionmark,
+            Key::bracketleft => EguiKey::OpenBracket,
+            Key::braceright => EguiKey::CloseBracket,
+            Key::grave => EguiKey::Backtick,
+            Key::minus => EguiKey::Minus,
+            Key::period => EguiKey::Period,
+            Key::plus => EguiKey::Plus,
+            Key::equal => EguiKey::Equals,
+            Key::semicolon => EguiKey::Semicolon,
+            Key::singlelowquotemark => EguiKey::Quote,
+            Key::_0 | Key::KP_0 => EguiKey::Num0,
+            Key::_1 | Key::KP_1 => EguiKey::Num1,
+            Key::_2 | Key::KP_2 => EguiKey::Num2,
+            Key::_3 | Key::KP_3 => EguiKey::Num3,
+            Key::_4 | Key::KP_4 => EguiKey::Num4,
+            Key::_5 | Key::KP_5 => EguiKey::Num5,
+            Key::_6 | Key::KP_6 => EguiKey::Num6,
+            Key::_7 | Key::KP_7 => EguiKey::Num7,
+            Key::_8 | Key::KP_8 => EguiKey::Num8,
+            Key::_9 | Key::KP_9 => EguiKey::Num9,
+            _ => return key.name().and_then(|name| egui::Key::from_name(&name)),
+        };
+        Some(key)
+    }
+
+    fn gdk_to_egui_modifiers(modifiers: gtk::gdk::ModifierType) -> egui::Modifiers {
+        use gtk::gdk::ModifierType;
+        egui::Modifiers {
+            alt: modifiers.contains(ModifierType::ALT_MASK),
+            ctrl: modifiers.contains(ModifierType::CONTROL_MASK),
+            shift: modifiers.contains(ModifierType::SHIFT_MASK),
+            mac_cmd: modifiers.contains(ModifierType::META_MASK),
+            #[cfg(target_os = "macos")]
+            command: modifiers.contains(ModifierType::META_MASK),
+            #[cfg(not(target_os = "macos"))]
+            command: modifiers.contains(ModifierType::CONTROL_MASK),
+        }
+    }
+
+    fn is_cut_command(modifiers: egui::Modifiers, key: egui::Key) -> bool {
+        key == egui::Key::Cut
+            || (modifiers.command && key == egui::Key::X)
+            || (cfg!(target_os = "windows") && modifiers.shift && key == egui::Key::Delete)
+    }
+
+    fn is_copy_command(modifiers: egui::Modifiers, key: egui::Key) -> bool {
+        key == egui::Key::Copy
+            || (modifiers.command && key == egui::Key::C)
+            || (cfg!(target_os = "windows") && modifiers.ctrl && key == egui::Key::Insert)
+    }
+
+    fn is_paste_command(modifiers: egui::Modifiers, key: egui::Key) -> bool {
+        key == egui::Key::Paste
+            || (modifiers.command && key == egui::Key::V)
+            || (cfg!(target_os = "windows") && modifiers.shift && key == egui::Key::Insert)
     }
 }
