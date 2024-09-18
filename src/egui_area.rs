@@ -215,12 +215,12 @@ mod imp {
 
     impl GLAreaImpl for EguiArea {
         fn render(&self, _context: &GLContext) -> glib::Propagation {
-            let screen_size = self.native_size();
+            let screen_size_pixels = self.native_size();
             let bg_color = self.egui_ctx.style().visuals.window_fill();
 
             let mut painter_guard = self.painter.borrow_mut();
             let painter = painter_guard.as_mut().unwrap();
-            painter.clear(screen_size, bg_color.to_normalized_gamma_f32());
+            painter.clear(screen_size_pixels, bg_color.to_normalized_gamma_f32());
 
             if let Some(run_ui) = self.run_ui.borrow().as_ref() {
                 let input_events: Vec<egui::Event> =
@@ -234,7 +234,7 @@ mod imp {
                     events: input_events,
                     screen_rect: Some(egui::Rect::from_min_size(
                         Default::default(),
-                        egui::Vec2::new(screen_size[0] as f32, screen_size[1] as f32),
+                        egui::Vec2::new(self.obj().width() as f32, self.obj().width() as f32),
                     )),
                     viewports: [(
                         egui::ViewportId::ROOT,
@@ -254,7 +254,7 @@ mod imp {
                     .egui_ctx
                     .tessellate(full_output.shapes, full_output.pixels_per_point);
                 painter.paint_and_update_textures(
-                    screen_size,
+                    screen_size_pixels,
                     self.egui_ctx.pixels_per_point(),
                     &clipped_primitives,
                     &full_output.textures_delta,
