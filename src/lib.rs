@@ -1,28 +1,38 @@
+#![doc = include_str!("../README.md")]
+
+pub use egui;
+
 use gtk::{
     glib::{self, Object},
     subclass::prelude::ObjectSubclassIsExt,
 };
-use std::time::Duration;
+use std::{ptr, sync::OnceLock, time::Duration};
 
 glib::wrapper! {
+    /// Widget for drawing an [`egui`] UI. Inherits from [`gtk::GLArea`].
     pub struct EguiArea(ObjectSubclass<imp::EguiArea>)
         @extends gtk::GLArea, gtk::Widget,
         @implements gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget;
 }
 
 impl EguiArea {
+    /// Construct a new [`EguiArea`] with the provided egui UI function.
     pub fn new(ui: impl Fn(&egui::Context) + 'static) -> Self {
         let area: Self = Object::builder().build();
         area.set_ui(ui);
         area
     }
 
+    /// Construct a new [`EguiArea`] with the provided egui UI function and an FPS limit.
     pub fn with_max_fps(run_ui: impl Fn(&egui::Context) + 'static, max_fps: u32) -> Self {
         let area = Self::new(run_ui);
         area.set_max_fps(max_fps);
         area
     }
 
+    /// Set the maximum FPS for drawing the egui UI.
+    ///
+    /// This can be useful for reducing CPU usage when you don't need to rerender the UI on every display refresh.
     pub fn set_max_fps(&self, max_fps: u32) {
         self.imp()
             .min_render_interval
@@ -31,16 +41,19 @@ impl EguiArea {
             )));
     }
 
+    /// Set a new egui UI function.
     pub fn set_ui(&self, ui: impl Fn(&egui::Context) + 'static) {
         *self.imp().run_ui.borrow_mut() = Some(Box::new(ui));
     }
 
+    /// Access the inner [`egui::Context`].
     pub fn egui_ctx(&self) -> &egui::Context {
         &self.imp().egui_ctx
     }
 }
 
 mod imp {
+    use super::init_epoxy;
     use egui_glow::glow;
     use glib::clone;
     use gtk::{
@@ -84,9 +97,13 @@ mod imp {
         fn constructed(&self) {
             self.parent_constructed();
 
+            init_epoxy();
+
             let obj = self.obj().clone();
             obj.set_can_focus(true);
             obj.set_focusable(true);
+            obj.set_hexpand(true);
+            obj.set_vexpand(true);
 
             self.register_controllers();
 
@@ -138,15 +155,11 @@ mod imp {
                 let input_events: Vec<egui::Event> =
                     std::mem::take(self.input_events.borrow_mut().as_mut());
 
-                if !input_events.is_empty() {
-                    println!("input events: {input_events:?}");
-                }
-
                 let input = egui::RawInput {
                     events: input_events,
                     screen_rect: Some(egui::Rect::from_min_size(
                         Default::default(),
-                        egui::Vec2::new(self.obj().width() as f32, self.obj().width() as f32),
+                        egui::Vec2::new(self.obj().width() as f32, self.obj().height() as f32),
                     )),
                     viewports: [(
                         egui::ViewportId::ROOT,
@@ -429,4 +442,25 @@ mod imp {
             || (modifiers.command && key == egui::Key::V)
             || (cfg!(target_os = "windows") && modifiers.shift && key == egui::Key::Insert)
     }
+}
+
+fn init_epoxy() {
+    static EPOXY_INIT: OnceLock<()> = OnceLock::new();
+
+    EPOXY_INIT.get_or_init(|| {
+        #[cfg(target_os = "macos")]
+        let library = unsafe { libloading::os::unix::Library::new("libepoxy.0.dylib") }.unwrap();
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let library = unsafe { libloading::os::unix::Library::new("libepoxy.so.0") }.unwrap();
+        #[cfg(windows)]
+        let library = libloading::os::windows::Library::open_already_loaded("libepoxy-0.dll")
+            .or_else(|_| libloading::os::windows::Library::open_already_loaded("epoxy-0.dll"))
+            .unwrap();
+
+        epoxy::load_with(|name| {
+            unsafe { library.get::<_>(name.as_bytes()) }
+                .map(|symbol| *symbol)
+                .unwrap_or(ptr::null())
+        });
+    });
 }
