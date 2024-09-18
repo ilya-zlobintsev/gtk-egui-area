@@ -45,7 +45,7 @@ mod imp {
     use gtk::{
         gdk::GLContext,
         glib,
-        prelude::{GLAreaExt, WidgetExt, WidgetExtManual},
+        prelude::{GLAreaExt, NativeExt, SurfaceExt, WidgetExt, WidgetExtManual},
         subclass::{
             prelude::{
                 GLAreaImpl, ObjectImpl, ObjectImplExt, ObjectSubclass, ObjectSubclassExt,
@@ -215,9 +215,7 @@ mod imp {
 
     impl GLAreaImpl for EguiArea {
         fn render(&self, _context: &GLContext) -> glib::Propagation {
-            let obj = self.obj();
-            let screen_size = [obj.width() as u32, obj.height() as u32];
-
+            let screen_size = self.native_size();
             let bg_color = self.egui_ctx.style().visuals.window_fill();
 
             let mut painter_guard = self.painter.borrow_mut();
@@ -236,8 +234,17 @@ mod imp {
                     events: input_events,
                     screen_rect: Some(egui::Rect::from_min_size(
                         Default::default(),
-                        egui::Vec2::new(obj.width() as f32, obj.height() as f32),
+                        egui::Vec2::new(screen_size[0] as f32, screen_size[1] as f32),
                     )),
+                    viewports: [(
+                        egui::ViewportId::ROOT,
+                        egui::ViewportInfo {
+                            native_pixels_per_point: Some(self.scale_factor()),
+                            ..Default::default()
+                        },
+                    )]
+                    .into_iter()
+                    .collect(),
                     ..egui::RawInput::default()
                 };
 
@@ -255,6 +262,29 @@ mod imp {
             }
 
             glib::Propagation::Stop
+        }
+    }
+
+    impl EguiArea {
+        fn scale_factor(&self) -> f32 {
+            if let Some(native) = self.obj().native() {
+                if let Some(surface) = native.surface() {
+                    // TODO: with gtk 4.12+ this can be float
+                    return surface.scale_factor() as f32;
+                }
+            }
+            1.0
+        }
+
+        fn native_size(&self) -> [u32; 2] {
+            let scale_factor = self.scale_factor();
+
+            let width = self.obj().width() as f32;
+            let height = self.obj().height() as f32;
+            [
+                (width * scale_factor) as u32,
+                (height * scale_factor) as u32,
+            ]
         }
     }
 }
