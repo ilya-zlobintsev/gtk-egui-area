@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "EguiArea widget for embedding inside of GTK"
 license = "MIT"
+repository = "https://github.com/ilya-zlobintsev/gtk-egui-area"
 
 [dependencies]
 egui = "0.28.1"
