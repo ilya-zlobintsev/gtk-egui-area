@@ -147,6 +147,8 @@ mod imp {
             let screen_size_pixels = self.native_size();
             let bg_color = self.egui_ctx.style().visuals.window_fill();
 
+            let focused = self.obj().has_focus();
+
             let mut painter_guard = self.painter.borrow_mut();
             let painter = painter_guard.as_mut().unwrap();
             painter.clear(screen_size_pixels, bg_color.to_normalized_gamma_f32());
@@ -165,11 +167,13 @@ mod imp {
                         egui::ViewportId::ROOT,
                         egui::ViewportInfo {
                             native_pixels_per_point: Some(self.scale_factor()),
+                            focused: Some(focused),
                             ..Default::default()
                         },
                     )]
                     .into_iter()
                     .collect(),
+                    focused,
                     ..egui::RawInput::default()
                 };
 
@@ -240,7 +244,9 @@ mod imp {
                 #[strong]
                 obj,
                 move |_gesture, _num, x, y| {
+                    obj.grab_focus();
                     let mut events = obj.imp().input_events.borrow_mut();
+
                     events.push(egui::Event::PointerButton {
                         pos: egui::pos2(x as f32, y as f32),
                         button: egui::PointerButton::Primary,
