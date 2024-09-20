@@ -52,6 +52,12 @@ impl EguiArea {
     }
 }
 
+impl Default for EguiArea {
+    fn default() -> Self {
+        Self::new(|_ctx| {})
+    }
+}
+
 mod imp {
     use super::init_epoxy;
     use egui_glow::glow;
