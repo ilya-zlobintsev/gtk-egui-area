@@ -599,7 +599,7 @@ dependencies = [
 
 [[package]]
 name = "gtk-egui-area"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "egui",
  "egui_demo_lib",
