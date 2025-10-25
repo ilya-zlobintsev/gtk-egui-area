@@ -1,18 +1,18 @@
 [package]
 name = "gtk-egui-area"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "EguiArea widget for embedding inside of GTK"
 license = "MIT"
 repository = "https://github.com/ilya-zlobintsev/gtk-egui-area"
 
 [dependencies]
-egui = "0.28.1"
-egui_glow = "0.28.1"
+egui = "0.32.3"
+egui_glow = "0.32.3"
 epoxy = "0.1.0"
 gl_loader = "0.1.2"
-gtk = { version = "0.9.1", package = "gtk4" }
-libloading = "0.8.5"
+gtk = { version = "0.10.1", package = "gtk4" }
+libloading = "0.8.9"
 
 [dev-dependencies]
-egui_demo_lib = "0.28.1"
+egui_demo_lib = "0.32.3"

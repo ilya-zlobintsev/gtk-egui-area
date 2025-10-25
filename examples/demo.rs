@@ -1,8 +1,12 @@
-use gtk::{prelude::*, Application, ApplicationWindow};
+use gtk::{prelude::*, glib, Application, ApplicationWindow};
 use gtk_egui_area::EguiArea;
 use std::cell::RefCell;
 
 fn main() {
+    unsafe {
+        std::env::set_var("GDK_BACKEND", "wayland,x11");
+    }
+
     let app = Application::builder().build();
 
     app.connect_activate(build_ui);
@@ -29,6 +33,17 @@ fn build_ui(app: &Application) {
     frame.set_child(Some(&egui_area));
 
     window.set_child(Some(&frame));
+
+    // recommended
+    let app_clone = app.clone();
+    window.connect_close_request(move |w| {
+        w.hide(); // stop gtk to send draw events, prevent egui to use destroyed gl context
+        let app_clone = app_clone.clone();
+        glib::MainContext::default().spawn_local(async move {
+            app_clone.quit();
+        });
+        glib::Propagation::Stop
+    });
 
     window.present();
 }

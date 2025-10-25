@@ -2,94 +2,88 @@
 
 pub use egui;
 
-use gtk::{
-    glib::{self, Object},
-    subclass::prelude::ObjectSubclassIsExt,
-};
-use std::{ptr, sync::OnceLock, time::Duration};
+use gtk::{glib, prelude::*};
+use std::{cell::{Cell, RefCell}, rc::Rc, sync::Arc, time::{Duration, Instant}};
+use gtk::subclass::prelude::*;
 
 glib::wrapper! {
-    /// Widget for drawing an [`egui`] UI. Inherits from [`gtk::GLArea`].
+    /// This type is a thin wrapper around a GObject subclass implemented in the
+    /// `imp` module below.
     pub struct EguiArea(ObjectSubclass<imp::EguiArea>)
         @extends gtk::GLArea, gtk::Widget,
         @implements gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget;
 }
 
 impl EguiArea {
-    /// Construct a new [`EguiArea`] with the provided egui UI function.
+    /// The `ui` closure is called every frame (from the GLArea render pass) and
+    /// receives a reference to `egui::Context` to construct the UI.
     pub fn new(ui: impl Fn(&egui::Context) + 'static) -> Self {
-        let area: Self = Object::builder().build();
+        let area: Self = glib::Object::builder().build();
         area.set_ui(ui);
         area
     }
 
-    /// Construct a new [`EguiArea`] with the provided egui UI function and an FPS limit.
-    pub fn with_max_fps(run_ui: impl Fn(&egui::Context) + 'static, max_fps: u32) -> Self {
-        let area = Self::new(run_ui);
+    /// Create with an FPS cap (frames-per-second). Setting this can reduce CPU
+    /// usage when you don't need continuous high-rate rendering.
+    pub fn with_max_fps(ui: impl Fn(&egui::Context) + 'static, max_fps: u32) -> Self {
+        let area = Self::new(ui);
         area.set_max_fps(max_fps);
         area
     }
 
-    /// Set the maximum FPS for drawing the egui UI.
-    ///
-    /// This can be useful for reducing CPU usage when you don't need to rerender the UI on every display refresh.
+    /// Set a maximum FPS. `None` (default) means render as often as GTK asks.
     pub fn set_max_fps(&self, max_fps: u32) {
-        self.imp()
-            .min_render_interval
-            .set(Some(Duration::from_micros(
-                ((1000.0 / max_fps as f64) * 1000.0) as u64,
-            )));
+        self.imp().min_render_interval.set(Some(Duration::from_micros(
+            ((1000.0 / max_fps as f64) * 1000.0) as u64
+        )));
     }
 
-    /// Set a new egui UI function.
+    /// Replace the UI closure that will be executed each frame.
     pub fn set_ui(&self, ui: impl Fn(&egui::Context) + 'static) {
         *self.imp().run_ui.borrow_mut() = Some(Box::new(ui));
     }
 
-    /// Access the inner [`egui::Context`].
+    // Get a reference to the inner `egui::Context` if you need advanced control.
     pub fn egui_ctx(&self) -> &egui::Context {
         &self.imp().egui_ctx
     }
 }
 
-impl Default for EguiArea {
-    fn default() -> Self {
-        Self::new(|_ctx| {})
-    }
-}
-
 mod imp {
-    use super::init_epoxy;
+    use super::*;
+    use egui;
     use egui_glow::glow;
-    use glib::clone;
-    use gtk::{
-        gdk::GLContext,
-        gio, glib,
-        prelude::{Cast, GLAreaExt, NativeExt, SurfaceExt, WidgetExt, WidgetExtManual},
-        subclass::{
-            prelude::{
-                GLAreaImpl, ObjectImpl, ObjectImplExt, ObjectSubclass, ObjectSubclassExt,
-                ObjectSubclassIsExt,
-            },
-            widget::{WidgetImpl, WidgetImplExt},
-        },
-    };
-    use std::{
-        cell::{Cell, RefCell},
-        rc::Rc,
-        sync::Arc,
-        time::{Duration, Instant},
-    };
+    use gtk::{gdk, gio};
 
     type DynGuiFn = Box<dyn Fn(&egui::Context)>;
 
+    /// Implementation struct for the GObject subclass.
     #[derive(Default)]
     pub struct EguiArea {
+        /// The GPU painter from `egui_glow`.
         painter: RefCell<Option<egui_glow::Painter>>,
+
+        /// The egui context we drive every frame.
         pub(super) egui_ctx: egui::Context,
+
+        /// Queue of input events collected from GTK between frames.
         input_events: RefCell<Vec<egui::Event>>,
+
+        /// Optional minimum time between renders (used for FPS limiting).
         pub(super) min_render_interval: Cell<Option<Duration>>,
+
+        /// The user-provided UI closure that runs each frame.
         pub(super) run_ui: RefCell<Option<DynGuiFn>>,
+
+        /// GTK IM context used to support system IMEs (preedit / commit).
+        im_context: RefCell<Option<gtk::IMMulticontext>>,
+
+        /// Tracks whether the widget currently has focus (so we can call
+        /// im_context.focus_in/focus_out only on changes).
+        focused: Cell<bool>,
+
+        /// Current modifier state (kept so pointer/key events can include modifiers).
+        modifiers: Rc<Cell<egui::Modifiers>>
     }
 
     #[glib::object_subclass]
@@ -102,7 +96,8 @@ mod imp {
     impl ObjectImpl for EguiArea {
         fn constructed(&self) {
             self.parent_constructed();
-
+            
+            // Make sure GL symbols are available.
             init_epoxy();
 
             let obj = self.obj().clone();
@@ -111,21 +106,95 @@ mod imp {
             obj.set_hexpand(true);
             obj.set_vexpand(true);
 
+            // Create and configure IM context early so event controllers can use it.
+            let im = gtk::IMMulticontext::new();
+            // Ask the IMContext to use preedit strings (so we receive preedit
+            // contents via `preedit_string()` and `commit()` signals).
+            im.set_use_preedit(true);
+            // Bind the IM context to this widget so some IMs can position windows
+            // relative to it.
+            im.set_client_widget(Some(&obj));
+            
+            // Keep a reference for later platform-output handling.
+            *self.im_context.borrow_mut() = Some(im.clone());
+
+            // Register all input controllers (pointer, keyboard, scroll, gestures).
             self.register_controllers();
 
+            // When focus changes we must notify IMContext (so e.g. candidate
+            // windows appear/disappear correctly). We track focus changes in the
+            // render pass (where `has_focus()` is always available), but we also
+            // listen to focus events to be robust.
+            let im_for_focus = self.im_context.borrow().clone();
+            obj.connect_notify_local(Some("has-focus"), move |widget, _pspec| {
+                if let Some(im) = im_for_focus.as_ref() {
+                    if widget.has_focus() {
+                        im.focus_in();
+                    } else {
+                        im.focus_out();
+                    }
+                }
+            });
+
+            // Tick callback: request redraw according to FPS cap.
             let last_render = Cell::new(Instant::now());
-            obj.add_tick_callback(move |area, _frame_clock| {
+            obj.add_tick_callback(move |area, _clock| {
                 let should_render = match area.imp().min_render_interval.get() {
                     Some(min_interval) => last_render.get().elapsed() > min_interval,
                     None => true,
                 };
-
                 if should_render {
                     area.queue_render();
                     last_render.set(Instant::now());
                 }
                 glib::ControlFlow::Continue
             });
+
+            // Connect IM signals to push egui Ime events.
+            if let Some(im) = self.im_context.borrow().as_ref() {
+                let obj = self.obj().downgrade();
+                // `commit` -> final text, send as Ime::Commit
+                im.connect_commit(move |_im, text| {
+                    if let Some(obj) = obj.upgrade() {
+                        let mut events = obj.imp().input_events.borrow_mut();
+                        events.push(egui::Event::Ime(egui::ImeEvent::Commit(text.to_string())));
+                    };
+                });
+
+                // `preedit-changed` -> read current preedit string and forward it.
+                let obj = self.obj().downgrade();
+                im.connect_preedit_changed(move |im| {
+                    // preedit_string returns (text, attr_list, cursor_pos)
+                    let (preedit, _attrs, _pos) = im.preedit_string();
+                    if let Some(obj) = obj.upgrade() {
+                        let mut events = obj.imp().input_events.borrow_mut();
+                        events.push(egui::Event::Ime(egui::ImeEvent::Preedit(preedit.to_string())));
+                    }
+                });
+
+                // preedit_start/end - forward Enabled/Disabled.
+                let obj = self.obj().downgrade();
+                im.connect_preedit_start(move |_im| {
+                    if let Some(obj) = obj.upgrade() {
+                        let mut events = obj.imp().input_events.borrow_mut();
+                        events.push(egui::Event::Ime(egui::ImeEvent::Enabled));
+                    }
+                });
+                let obj = self.obj().downgrade();
+                im.connect_preedit_end(move |_im| {
+                    if let Some(obj) = obj.upgrade() {
+                        let mut events = obj.imp().input_events.borrow_mut();
+                        events.push(egui::Event::Ime(egui::ImeEvent::Disabled));
+                    }
+                });
+            }
+        }
+
+        fn dispose(&self) {
+            if let Some(im) = self.im_context.borrow_mut().take() {
+                im.set_client_widget(None::<&gtk::Widget>);
+            }
+            *self.painter.borrow_mut() = None;
         }
     }
 
@@ -133,11 +202,15 @@ mod imp {
         fn realize(&self) {
             self.parent_realize();
 
+            // Make GL context current and create the egui_glow painter.
             self.obj().make_current();
             let gl = unsafe { glow::Context::from_loader_function(epoxy::get_proc_addr) };
-            #[allow(clippy::arc_with_non_send_sync)]
+            // Wrap in Arc as egui_glow::Painter wants a shared GL context.
             let gl = Arc::new(gl);
-            *self.painter.borrow_mut() = Some(egui_glow::Painter::new(gl, "", None).unwrap());
+            *self.painter.borrow_mut() = Some(
+                egui_glow::Painter::new(gl, "", None, true)
+                    .expect("Failed to create painter")
+            );
         }
 
         fn unrealize(&self) {
@@ -149,47 +222,64 @@ mod imp {
     }
 
     impl GLAreaImpl for EguiArea {
-        fn render(&self, _context: &GLContext) -> glib::Propagation {
+        fn render(&self, _context: &gdk::GLContext) -> glib::Propagation {
+            let area = self.obj();
+
             let screen_size_pixels = self.native_size();
+
+            // Background color from egui style
             let bg_color = self.egui_ctx.style().visuals.window_fill();
 
-            let focused = self.obj().has_focus();
+            let focused_now = area.has_focus();
+            if focused_now != self.focused.get() {
+                // Focus changed; inform IM context once.
+                self.focused.set(focused_now);
+                if let Some(im) = self.im_context.borrow().as_ref() {
+                    if focused_now {
+                        im.focus_in();
+                    } else {
+                        im.focus_out();
+                    }
+                }
+            }
 
+            // Clear the GL canvas via painter helper
             let mut painter_guard = self.painter.borrow_mut();
             let painter = painter_guard.as_mut().unwrap();
             painter.clear(screen_size_pixels, bg_color.to_normalized_gamma_f32());
 
             if let Some(run_ui) = self.run_ui.borrow().as_ref() {
-                let input_events: Vec<egui::Event> =
-                    std::mem::take(self.input_events.borrow_mut().as_mut());
+                let input_events: Vec<egui::Event> = std::mem::take(self.input_events.borrow_mut().as_mut());
 
+                // Build egui RawInput: minimal, but correct. All coordinates are in
+                // points. We pass the widget size in points via screen_rect.
                 let input = egui::RawInput {
                     events: input_events,
                     screen_rect: Some(egui::Rect::from_min_size(
                         Default::default(),
-                        egui::Vec2::new(self.obj().width() as f32, self.obj().height() as f32),
+                        egui::Vec2::new(area.width() as f32, area.height() as f32),
                     )),
                     viewports: [(
                         egui::ViewportId::ROOT,
                         egui::ViewportInfo {
+                            // Tell egui the underlying native pixel ratio for this surface.
                             native_pixels_per_point: Some(self.scale_factor()),
-                            focused: Some(focused),
+                            focused: Some(focused_now),
                             ..Default::default()
                         },
-                    )]
-                    .into_iter()
-                    .collect(),
-                    focused,
+                    )].into_iter().collect(),
+                    focused: focused_now,
                     ..egui::RawInput::default()
                 };
 
-                let full_output = self.egui_ctx.run(input, run_ui);
+                // Run egui UI
+                let full_output = self.egui_ctx.run(input, |ctx| run_ui(ctx));
 
+                // Platform output
                 self.handle_platform_output(full_output.platform_output);
 
-                let clipped_primitives = self
-                    .egui_ctx
-                    .tessellate(full_output.shapes, full_output.pixels_per_point);
+                // Tessellate and draw.
+                let clipped_primitives = self.egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
                 painter.paint_and_update_textures(
                     screen_size_pixels,
                     self.egui_ctx.pixels_per_point(),
@@ -203,19 +293,19 @@ mod imp {
     }
 
     impl EguiArea {
+        /// Helper: obtain the scale factor of the native surface.
         fn scale_factor(&self) -> f32 {
             if let Some(native) = self.obj().native() {
                 if let Some(surface) = native.surface() {
-                    // TODO: with gtk 4.12+ this can be float
                     return surface.scale_factor() as f32;
                 }
             }
             1.0
         }
 
+        /// Helper: compute native size in device pixels [width, height].
         fn native_size(&self) -> [u32; 2] {
             let scale_factor = self.scale_factor();
-
             let width = self.obj().width() as f32;
             let height = self.obj().height() as f32;
             [
@@ -224,208 +314,272 @@ mod imp {
             ]
         }
 
+        /// Handle egui's `PlatformOutput` (non-rendering commands).
+        /// 
+        /// This includes: clipboard text, open_url, IME placement.
         fn handle_platform_output(&self, output: egui::PlatformOutput) {
-            if !output.copied_text.is_empty() {
-                let clipboard = self.obj().clipboard();
-                clipboard.set_text(&output.copied_text);
+            for cmd in output.commands {
+                match cmd {
+                    egui::OutputCommand::CopyText(text) => {
+                        if !text.is_empty() {
+                            let clipboard = self.obj().clipboard();
+                            clipboard.set_text(&text);
+                        }
+                    }
+                    egui::OutputCommand::CopyImage(_image) => {
+                        eprintln!("Not Planned");
+                    }
+                    egui::OutputCommand::OpenUrl(open) => {
+                        let window = self.obj().root()
+                            .and_then(|r| r.downcast::<gtk::Window>().ok());
+                        if let Some(win) = window.as_ref() {
+                            let _ = gtk::show_uri(Some(win), &open.url, 0);
+                        } else {
+                            let _ = gtk::show_uri(None::<&gtk::Window>, &open.url, 0);
+                        }
+                    }
+                }
             }
 
-            if let Some(url) = output.open_url {
-                let window = self
-                    .obj()
-                    .root()
-                    .and_then(|root| root.downcast::<gtk::Window>().ok());
-                gtk::show_uri(window.as_ref(), &url.url, 0);
+            // IME placement
+            if let Some(ime) = output.ime {
+                if let Some(im) = self.im_context.borrow().as_ref() {
+                    // point -> physical pixel
+                    let ppp = self.egui_ctx.pixels_per_point();
+                    let cursor = ime.cursor_rect;
+                    let x = (cursor.min.x * ppp).round() as i32;
+                    let y = (cursor.min.y * ppp).round() as i32;
+                    let w = ((cursor.max.x - cursor.min.x) * ppp).ceil() as i32;
+                    let h = ((cursor.max.y - cursor.min.y) * ppp).ceil() as i32;
+                    let rect = gdk::Rectangle::new(x, y, w, h);
+                    im.set_cursor_location(&rect);
+                }
             }
         }
 
+        /// Register GTK event controllers (pointer, scroll, gestures, keyboard) and
+        /// translate them to `egui::Event`s stored in `input_events`.
         fn register_controllers(&self) {
             let obj = self.obj().clone();
-            let current_modifiers = Rc::new(Cell::new(egui::Modifiers::default()));
 
+            // Hold the modifiers state so all input events include the correct modifier keys.
+            // Rc<Cell<Modifiers>> allows sharing and interior mutability across closures.
+            let current_modifiers = self.modifiers.clone();
+            current_modifiers.set(egui::Modifiers::default());
+
+            // Click
             let gesture_click = gtk::GestureClick::new();
-            gesture_click.connect_pressed(clone!(
-                #[strong]
-                current_modifiers,
-                #[strong]
-                obj,
-                move |_gesture, _num, x, y| {
+            gesture_click.set_button(0);
+            {
+                let obj = obj.clone();
+                let current_modifiers = current_modifiers.clone();
+                gesture_click.connect_pressed(move |gesture, _num, x, y| {
                     obj.grab_focus();
                     let mut events = obj.imp().input_events.borrow_mut();
-
+                    let button = match gesture.current_button() {
+                        1 => egui::PointerButton::Primary,
+                        3 => egui::PointerButton::Secondary,
+                        _ => return,
+                    };
                     events.push(egui::Event::PointerButton {
                         pos: egui::pos2(x as f32, y as f32),
-                        button: egui::PointerButton::Primary,
+                        button,
                         pressed: true,
                         modifiers: current_modifiers.get(),
                     });
-                }
-            ));
-            gesture_click.connect_released(clone!(
-                #[strong]
-                current_modifiers,
-                #[strong]
-                obj,
-                move |_gesture, _num, x, y| {
+                });
+            }
+            {
+                let obj = obj.clone();
+                let current_modifiers = current_modifiers.clone();
+                gesture_click.connect_released(move |gesture, _num, x, y| {
                     let mut events = obj.imp().input_events.borrow_mut();
+                    let button = match gesture.current_button() {
+                        1 => egui::PointerButton::Primary,
+                        3 => egui::PointerButton::Secondary,
+                        _ => return,
+                    };
                     events.push(egui::Event::PointerButton {
                         pos: egui::pos2(x as f32, y as f32),
-                        button: egui::PointerButton::Primary,
+                        button,
                         pressed: false,
                         modifiers: current_modifiers.get(),
                     });
-                }
-            ));
+                });
+            }
 
-            let obj = self.obj().clone();
-            let event_controller_motion = gtk::EventControllerMotion::new();
-            event_controller_motion.connect_motion(move |_motion, x, y| {
-                let mut events = obj.imp().input_events.borrow_mut();
-                events.push(egui::Event::PointerMoved(egui::pos2(x as f32, y as f32)));
-            });
-            let obj = self.obj().clone();
-            event_controller_motion.connect_leave(move |_motion| {
-                let mut events = obj.imp().input_events.borrow_mut();
-                events.push(egui::Event::PointerGone);
-            });
+            // Move
+            let motion = gtk::EventControllerMotion::new();
+            {
+                let obj = obj.clone();
+                motion.connect_motion(move |_motion, x, y| {
+                    let mut events = obj.imp().input_events.borrow_mut();
+                    events.push(egui::Event::PointerMoved(egui::pos2(x as f32, y as f32)));
+                });
+            }
+            {
+                let obj = obj.clone();
+                motion.connect_leave(move |_motion| {
+                    let mut events = obj.imp().input_events.borrow_mut();
+                    events.push(egui::Event::PointerGone);
+                });
+            }
 
-            let obj = self.obj().clone();
-
-            let event_controller_scroll = gtk::EventControllerScroll::new(
-                gtk::EventControllerScrollFlags::BOTH_AXES
+            // Scroll
+            let scroll = gtk::EventControllerScroll::new(
+                gtk::EventControllerScrollFlags::BOTH_AXES 
                     | gtk::EventControllerScrollFlags::DISCRETE,
             );
-            event_controller_scroll.connect_scroll(clone!(
-                #[strong]
-                current_modifiers,
-                move |_scroll, x, y| {
+            {
+                let obj = obj.clone();
+                let current_modifiers = current_modifiers.clone();
+                scroll.connect_scroll(move |_scroll, x, y| {
                     let mut events = obj.imp().input_events.borrow_mut();
-
                     events.push(egui::Event::MouseWheel {
                         unit: egui::MouseWheelUnit::Line,
                         delta: egui::Vec2::new(-x as f32, -y as f32),
                         modifiers: current_modifiers.get(),
                     });
                     glib::Propagation::Proceed
-                }
-            ));
+                });
+            }
 
-            let obj = self.obj().clone();
-            let event_controller_key = gtk::EventControllerKey::new();
-            event_controller_key.connect_key_pressed(move |_controller, key, _code, modifiers| {
-                let mut events = obj.imp().input_events.borrow_mut();
+            // Key
+            let key_controller = gtk::EventControllerKey::new();
+            {
+                let obj = obj.clone();
+                key_controller.connect_key_pressed(move |_controller, key, _code, modifiers| {
+                    let mut events = obj.imp().input_events.borrow_mut();
+                    let emod = gdk_to_egui_modifiers(modifiers);
 
-                if modifiers.is_empty() || modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK) {
-                    if let Some(char) = key.to_unicode() {
-                        if !char.is_control() {
-                            events.push(egui::Event::Text(char.into()));
+                    if key == gdk::Key::BackSpace {
+                        events.push(egui::Event::Key {
+                            key: egui::Key::Backspace,
+                            physical_key: None,
+                            pressed: true,
+                            repeat: false,
+                            modifiers: emod,
+                        });
+                        return glib::Propagation::Proceed;
+                    }
+                    
+                    // text input
+                    if modifiers.is_empty() || modifiers.contains(gdk::ModifierType::SHIFT_MASK) {
+                        if let Some(ch) = key.to_unicode() {
+                            events.push(egui::Event::Text(ch.into()));
                         }
                     }
-                }
 
-                if let Some(key) = gdk_to_egui_key(key) {
-                    let modifiers = gdk_to_egui_modifiers(modifiers);
+                    // egui keys
+                    if let Some(ekey) = gdk_to_egui_key(key) {
+                        if is_cut_command(emod, ekey) {
+                            events.push(egui::Event::Cut);
+                        } else if is_copy_command(emod, ekey) {
+                            events.push(egui::Event::Copy);
+                        } else if is_paste_command(emod, ekey) {
+                            let clipboard = obj.clipboard();
+                            let obj = obj.clone();
+                            clipboard.read_text_async(
+                                gio::Cancellable::NONE,
+                                move |result| {
+                                    if let Ok(Some(text)) = result {
+                                        obj.imp().input_events.borrow_mut().push(egui::Event::Paste(text.into()));
+                                    }
+                                }
+                            );
+                        }
 
-                    if is_copy_command(modifiers, key) {
-                        events.push(egui::Event::Copy);
-                    } else if is_cut_command(modifiers, key) {
-                        events.push(egui::Event::Cut);
-                    } else if is_paste_command(modifiers, key) {
-                        let clipboard = obj.clipboard();
-                        let obj = obj.clone();
-                        clipboard.read_text_async(gio::Cancellable::NONE, move |result| {
-                            if let Ok(Some(text)) = result {
-                                obj.imp()
-                                    .input_events
-                                    .borrow_mut()
-                                    .push(egui::Event::Paste(text.to_string()));
-                            }
+                        events.push(egui::Event::Key {
+                            key: ekey,
+                            physical_key: None,
+                            pressed: true,
+                            repeat: false,
+                            modifiers: emod,
                         });
                     }
 
-                    events.push(egui::Event::Key {
-                        key,
-                        physical_key: None,
-                        pressed: true,
-                        repeat: false,
-                        modifiers,
-                    });
-                }
-                glib::Propagation::Proceed
-            });
-            let obj = self.obj().clone();
-            event_controller_key.connect_key_released(move |_controller, key, _code, modifiers| {
-                let mut events = obj.imp().input_events.borrow_mut();
+                    glib::Propagation::Proceed
+                });
+            }
+            {
+                let obj = obj.clone();
+                key_controller.connect_key_released(move |_controller, key, _code, modifiers| {
+                    if let Some(ekey) = gdk_to_egui_key(key) {
+                        let mut events = obj.imp().input_events.borrow_mut();
+                        events.push(egui::Event::Key {
+                            key: ekey,
+                            physical_key: None,
+                            pressed: false,
+                            repeat: false,
+                            modifiers: gdk_to_egui_modifiers(modifiers),
+                        });
+                    }
+                });
+            }
+            {
+                let current_modifiers = current_modifiers.clone();
+                key_controller.connect_modifiers(move |_controller, new_modifiers| {
+                    current_modifiers.set(gdk_to_egui_modifiers(new_modifiers));
+                    glib::Propagation::Proceed
+                });
+            }
 
-                if let Some(key) = gdk_to_egui_key(key) {
-                    events.push(egui::Event::Key {
-                        key,
-                        physical_key: None,
-                        pressed: false,
-                        repeat: false,
-                        modifiers: gdk_to_egui_modifiers(modifiers),
-                    });
-                }
-            });
-            event_controller_key.connect_modifiers(move |_controller, new_modifiers| {
-                current_modifiers.set(gdk_to_egui_modifiers(new_modifiers));
-                glib::Propagation::Proceed
-            });
-
-            let obj = self.obj().clone();
-            obj.add_controller(event_controller_motion);
             obj.add_controller(gesture_click);
-            obj.add_controller(event_controller_scroll);
-            obj.add_controller(event_controller_key);
+            obj.add_controller(motion);
+            obj.add_controller(scroll);
+            obj.add_controller(key_controller);
         }
     }
 
-    fn gdk_to_egui_key(key: gtk::gdk::Key) -> Option<egui::Key> {
-        use egui::Key as EguiKey;
-        use gtk::gdk::Key;
-        let key = match key {
-            Key::BackSpace => EguiKey::Backspace,
-            Key::Down => EguiKey::ArrowDown,
-            Key::Up => EguiKey::ArrowUp,
-            Key::Left => EguiKey::ArrowLeft,
-            Key::Right => EguiKey::ArrowRight,
-            Key::KP_Enter | Key::ISO_Enter => EguiKey::Enter,
-            Key::space | Key::KP_Space => EguiKey::Space,
-            Key::Page_Up => EguiKey::PageUp,
-            Key::Page_Down => EguiKey::PageDown,
-            Key::colon => EguiKey::Colon,
-            Key::comma => EguiKey::Comma,
-            Key::backslash => EguiKey::Backslash,
-            Key::slash => EguiKey::Slash,
-            Key::vertbar => EguiKey::Pipe,
-            Key::question => EguiKey::Questionmark,
-            Key::bracketleft => EguiKey::OpenBracket,
-            Key::braceright => EguiKey::CloseBracket,
-            Key::grave => EguiKey::Backtick,
-            Key::minus => EguiKey::Minus,
-            Key::period => EguiKey::Period,
-            Key::plus => EguiKey::Plus,
-            Key::equal => EguiKey::Equals,
-            Key::semicolon => EguiKey::Semicolon,
-            Key::singlelowquotemark => EguiKey::Quote,
-            Key::_0 | Key::KP_0 => EguiKey::Num0,
-            Key::_1 | Key::KP_1 => EguiKey::Num1,
-            Key::_2 | Key::KP_2 => EguiKey::Num2,
-            Key::_3 | Key::KP_3 => EguiKey::Num3,
-            Key::_4 | Key::KP_4 => EguiKey::Num4,
-            Key::_5 | Key::KP_5 => EguiKey::Num5,
-            Key::_6 | Key::KP_6 => EguiKey::Num6,
-            Key::_7 | Key::KP_7 => EguiKey::Num7,
-            Key::_8 | Key::KP_8 => EguiKey::Num8,
-            Key::_9 | Key::KP_9 => EguiKey::Num9,
-            _ => return key.name().and_then(|name| egui::Key::from_name(&name)),
+    // Utility
+    fn gdk_to_egui_key(key: gdk::Key) -> Option<egui::Key> {
+        use egui::Key as EKey;
+        use gdk::Key as GKey;
+
+        let k = match key {
+            GKey::BackSpace => EKey::Backspace,
+            GKey::Down => EKey::ArrowDown,
+            GKey::Up => EKey::ArrowUp,
+            GKey::Left => EKey::ArrowLeft,
+            GKey::Right => EKey::ArrowRight,
+            GKey::KP_Enter | GKey::ISO_Enter => EKey::Enter,
+            GKey::space | GKey::KP_Space => EKey::Space,
+            GKey::Page_Up => EKey::PageUp,
+            GKey::Page_Down => EKey::PageDown,
+            GKey::colon => EKey::Colon,
+            GKey::comma => EKey::Comma,
+            GKey::backslash => EKey::Backslash,
+            GKey::slash => EKey::Slash,
+            GKey::vertbar => EKey::Pipe,
+            GKey::question => EKey::Questionmark,
+            GKey::bracketleft => EKey::OpenBracket,
+            GKey::braceright => EKey::CloseBracket,
+            GKey::grave => EKey::Backtick,
+            GKey::minus => EKey::Minus,
+            GKey::period => EKey::Period,
+            GKey::plus => EKey::Plus,
+            GKey::equal => EKey::Equals,
+            GKey::semicolon => EKey::Semicolon,
+            GKey::singlelowquotemark => EKey::Quote,
+            GKey::_0 | GKey::KP_0 => EKey::Num0,
+            GKey::_1 | GKey::KP_1 => EKey::Num1,
+            GKey::_2 | GKey::KP_2 => EKey::Num2,
+            GKey::_3 | GKey::KP_3 => EKey::Num3,
+            GKey::_4 | GKey::KP_4 => EKey::Num4,
+            GKey::_5 | GKey::KP_5 => EKey::Num5,
+            GKey::_6 | GKey::KP_6 => EKey::Num6,
+            GKey::_7 | GKey::KP_7 => EKey::Num7,
+            GKey::_8 | GKey::KP_8 => EKey::Num8,
+            GKey::_9 | GKey::KP_9 => EKey::Num9,
+            other => return other.name()
+                .and_then(|n| egui::Key::from_name(&n)),
         };
-        Some(key)
+        Some(k)
     }
 
-    fn gdk_to_egui_modifiers(modifiers: gtk::gdk::ModifierType) -> egui::Modifiers {
-        use gtk::gdk::ModifierType;
-        egui::Modifiers {
+    fn gdk_to_egui_modifiers(modifiers: gdk::ModifierType) -> egui::Modifiers {
+        use gdk::ModifierType;
+        egui::Modifiers { 
             alt: modifiers.contains(ModifierType::ALT_MASK),
             ctrl: modifiers.contains(ModifierType::CONTROL_MASK),
             shift: modifiers.contains(ModifierType::SHIFT_MASK),
@@ -454,25 +608,20 @@ mod imp {
             || (modifiers.command && key == egui::Key::V)
             || (cfg!(target_os = "windows") && modifiers.shift && key == egui::Key::Insert)
     }
-}
 
-fn init_epoxy() {
-    static EPOXY_INIT: OnceLock<()> = OnceLock::new();
+    fn init_epoxy() {
+        static EPOXY_INIT: std::sync::Once = std::sync::Once::new();
+        EPOXY_INIT.call_once(|| {
+            #[cfg(target_os = "macos")]
+            let library = unsafe { libloading::os::unix::Library::new("libepoxy.0.dylib").unwrap() };
+            #[cfg(all(unix, not(target_os = "macos")))]
+            let library = unsafe { libloading::os::unix::Library::new("libepoxy.so.0").unwrap() };
+            #[cfg(windows)]
+            let library = libloading::os::windows::Library::open_already_loaded("libepoxy-0.dll").or_else(|_| libloading::os::windows::Library::open_already_loaded("epoxy-0.dll")).unwrap();
 
-    EPOXY_INIT.get_or_init(|| {
-        #[cfg(target_os = "macos")]
-        let library = unsafe { libloading::os::unix::Library::new("libepoxy.0.dylib") }.unwrap();
-        #[cfg(all(unix, not(target_os = "macos")))]
-        let library = unsafe { libloading::os::unix::Library::new("libepoxy.so.0") }.unwrap();
-        #[cfg(windows)]
-        let library = libloading::os::windows::Library::open_already_loaded("libepoxy-0.dll")
-            .or_else(|_| libloading::os::windows::Library::open_already_loaded("epoxy-0.dll"))
-            .unwrap();
-
-        epoxy::load_with(|name| {
-            unsafe { library.get::<_>(name.as_bytes()) }
-                .map(|symbol| *symbol)
-                .unwrap_or(ptr::null())
+            epoxy::load_with(|name| unsafe {
+                library.get::<_>(name.as_bytes()).map(|sym| *sym).unwrap_or(std::ptr::null())
+            });
         });
-    });
+    }
 }
