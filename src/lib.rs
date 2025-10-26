@@ -83,7 +83,10 @@ mod imp {
         focused: Cell<bool>,
 
         /// Current modifier state (kept so pointer/key events can include modifiers).
-        modifiers: Rc<Cell<egui::Modifiers>>
+        modifiers: Rc<Cell<egui::Modifiers>>,
+
+        /// ID of the tick callback, so we can remove it on unrealize.
+        tick_id: RefCell<Option<gtk::TickCallbackId>>
     }
 
     #[glib::object_subclass]
@@ -138,10 +141,10 @@ mod imp {
 
             // Tick callback: request redraw according to FPS cap.
             let last_render = Cell::new(Instant::now());
-            obj.add_tick_callback(move |area, _clock| {
+            let tick_id = obj.add_tick_callback(move |area, _clock| {
                 let should_render = match area.imp().min_render_interval.get() {
                     Some(min_interval) => last_render.get().elapsed() > min_interval,
-                    None => true,
+                    None => true
                 };
                 if should_render {
                     area.queue_render();
@@ -149,6 +152,8 @@ mod imp {
                 }
                 glib::ControlFlow::Continue
             });
+            *self.tick_id.borrow_mut() = Some(tick_id);
+
 
             // Connect IM signals to push egui Ime events.
             if let Some(im) = self.im_context.borrow().as_ref() {
@@ -194,7 +199,7 @@ mod imp {
             if let Some(im) = self.im_context.borrow_mut().take() {
                 im.set_client_widget(None::<&gtk::Widget>);
             }
-            *self.painter.borrow_mut() = None;
+            // *self.painter.borrow_mut() = None; // Do it in unrealize()
         }
     }
 
@@ -214,10 +219,13 @@ mod imp {
         }
 
         fn unrealize(&self) {
-            self.parent_unrealize();
+            if let Some(id) = self.tick_id.borrow_mut().take() {
+                id.remove();
+            }
             if let Some(mut painter) = self.painter.borrow_mut().take() {
                 painter.destroy();
             }
+            self.parent_unrealize();
         }
     }
 
@@ -623,5 +631,15 @@ mod imp {
                 library.get::<_>(name.as_bytes()).map(|sym| *sym).unwrap_or(std::ptr::null())
             });
         });
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn init_backend() {
+    use std::env;
+
+    if env::var("WAYLAND_DISPLAY").is_ok() && env::var("DISPLAY").is_ok() {
+        env::set_var("GDK_BACKEND", "wayland");
+        println!("GDK_BACKEND set to wayland");
     }
 }
