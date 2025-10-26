@@ -3,8 +3,6 @@ use gtk_egui_area::EguiArea;
 use std::cell::RefCell;
 
 fn main() {
-    gtk_egui_area::init_backend();
-
     let app = Application::builder().build();
 
     app.connect_activate(build_ui);

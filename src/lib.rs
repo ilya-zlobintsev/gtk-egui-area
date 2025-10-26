@@ -639,13 +639,3 @@ mod imp {
         });
     }
 }
-
-#[cfg(target_os = "linux")]
-pub fn init_backend() {
-    use std::env;
-
-    if env::var("WAYLAND_DISPLAY").is_ok() && env::var("DISPLAY").is_ok() {
-        env::set_var("GDK_BACKEND", "wayland");
-        println!("GDK_BACKEND set to wayland");
-    }
-}
