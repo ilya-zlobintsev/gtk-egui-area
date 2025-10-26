@@ -49,6 +49,12 @@ impl EguiArea {
     }
 }
 
+impl Default for EguiArea {
+    fn default() -> Self {
+        Self::new(|_ctx| {})
+    }
+}
+
 mod imp {
     use super::*;
     use egui;
