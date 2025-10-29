@@ -11,6 +11,7 @@ Supported features:
 - Clipboard support
 - HiDPI Display handling
 - Opening URLs
+- IME support
 
 Not supported:
 - Accessibility
