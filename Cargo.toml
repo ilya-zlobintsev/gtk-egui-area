@@ -11,7 +11,7 @@ egui = "0.32.3"
 egui_glow = "0.32.3"
 epoxy = "0.1.0"
 gl_loader = "0.1.2"
-gtk = { version = "0.10.1", package = "gtk4" }
+gtk = { version = "0.11.1", package = "gtk4" }
 libloading = "0.8.9"
 
 [dev-dependencies]
