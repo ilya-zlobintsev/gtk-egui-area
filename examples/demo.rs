@@ -16,8 +16,8 @@ fn build_ui(app: &Application) {
     window.set_default_height(900);
 
     let demo_windows = RefCell::new(egui_demo_lib::DemoWindows::default());
-    let egui_area = EguiArea::new(move |ctx| {
-        demo_windows.borrow_mut().ui(ctx);
+    let egui_area = EguiArea::new(move |ui| {
+        demo_windows.borrow_mut().ui(ui);
     });
 
     let frame = gtk::Frame::new(Some("EGUI"));

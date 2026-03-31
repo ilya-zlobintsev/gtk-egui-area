@@ -7,12 +7,12 @@ license = "MIT"
 repository = "https://github.com/ilya-zlobintsev/gtk-egui-area"
 
 [dependencies]
-egui = "0.32.3"
-egui_glow = "0.32.3"
+egui = "0.34.1"
+egui_glow = "0.34.1"
 epoxy = "0.1.0"
 gl_loader = "0.1.2"
 gtk = { version = "0.11.1", package = "gtk4" }
 libloading = "0.8.9"
 
 [dev-dependencies]
-egui_demo_lib = "0.32.3"
+egui_demo_lib = "0.34.1"
