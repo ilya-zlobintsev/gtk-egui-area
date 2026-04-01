@@ -54,8 +54,8 @@ fn build_ui(app: &Application) {
 
     root_container.append(&gtk_controls);
 
-    let egui_area = EguiArea::new(move |ctx| {
-        egui::CentralPanel::default().show(ctx, |ui| {
+    let egui_area = EguiArea::new(move |ui| {
+        egui::CentralPanel::default().show_inside(ui, |ui| {
             let mut state = shared_state.borrow_mut();
 
             let text_edit_response = ui.text_edit_singleline(&mut state.text);

@@ -16,8 +16,8 @@ glib::wrapper! {
 
 impl EguiArea {
     /// The `ui` closure is called every frame (from the GLArea render pass) and
-    /// receives a reference to `egui::Context` to construct the UI.
-    pub fn new(ui: impl Fn(&egui::Context) + 'static) -> Self {
+    /// receives a `&mut egui::Ui` to construct the UI.
+    pub fn new(ui: impl Fn(&mut egui::Ui) + 'static) -> Self {
         let area: Self = glib::Object::builder().build();
         area.set_ui(ui);
         area
@@ -25,7 +25,7 @@ impl EguiArea {
 
     /// Create with an FPS cap (frames-per-second). Setting this can reduce CPU
     /// usage when you don't need continuous high-rate rendering.
-    pub fn with_max_fps(ui: impl Fn(&egui::Context) + 'static, max_fps: u32) -> Self {
+    pub fn with_max_fps(ui: impl Fn(&mut egui::Ui) + 'static, max_fps: u32) -> Self {
         let area = Self::new(ui);
         area.set_max_fps(max_fps);
         area
@@ -39,7 +39,7 @@ impl EguiArea {
     }
 
     /// Replace the UI closure that will be executed each frame.
-    pub fn set_ui(&self, ui: impl Fn(&egui::Context) + 'static) {
+    pub fn set_ui(&self, ui: impl Fn(&mut egui::Ui) + 'static) {
         *self.imp().run_ui.borrow_mut() = Some(Box::new(ui));
     }
 
@@ -51,7 +51,7 @@ impl EguiArea {
 
 impl Default for EguiArea {
     fn default() -> Self {
-        Self::new(|_ctx| {})
+        Self::new(|_ui| {})
     }
 }
 
@@ -61,7 +61,7 @@ mod imp {
     use egui_glow::glow;
     use gtk::{gdk, gio};
 
-    type DynGuiFn = Box<dyn Fn(&egui::Context)>;
+    type DynGuiFn = Box<dyn Fn(&mut egui::Ui)>;
 
     /// Implementation struct for the GObject subclass.
     #[derive(Default)]
@@ -242,7 +242,7 @@ mod imp {
             let screen_size_pixels = self.native_size();
 
             // Background color from egui style
-            let bg_color = self.egui_ctx.style().visuals.window_fill();
+            let bg_color = self.egui_ctx.global_style().visuals.window_fill();
 
             let focused_now = area.has_focus();
             if focused_now != self.focused.get() {
@@ -287,7 +287,7 @@ mod imp {
                 };
 
                 // Run egui UI
-                let full_output = self.egui_ctx.run(input, |ctx| run_ui(ctx));
+                let full_output = self.egui_ctx.run_ui(input, |ui| run_ui(ui));
 
                 // Platform output
                 self.handle_platform_output(full_output.platform_output);
@@ -452,6 +452,7 @@ mod imp {
                     events.push(egui::Event::MouseWheel {
                         unit: egui::MouseWheelUnit::Line,
                         delta: egui::Vec2::new(-x as f32, -y as f32),
+                        phase: egui::TouchPhase::Move,
                         modifiers: current_modifiers.get(),
                     });
                     glib::Propagation::Proceed
