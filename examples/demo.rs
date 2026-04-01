@@ -17,6 +17,8 @@ fn build_ui(app: &Application) {
 
     let demo_windows = RefCell::new(egui_demo_lib::DemoWindows::default());
     let egui_area = EguiArea::new(move |ui| {
+        egui_extras::install_image_loaders(ui.ctx());
+
         demo_windows.borrow_mut().ui(ui);
     });
 
